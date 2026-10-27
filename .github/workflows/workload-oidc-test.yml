@@ -101,7 +101,7 @@ jobs:
 
                 tok = r.json()["access_token"]; tc = jp(tok)
                 ck("1. DPoP type", r.json()["token_type"] == "DPoP")
-                ck("1. sub=agent", tc["sub"] == "agt_xv4xkrvhmk", tc["sub"])
+                ck("1. sub=agent", tc["sub"] == "agt_y7txgdwcc6", tc["sub"])
                 ck("1. iss=realm", tc["iss"] == REALM_URI)
                 ck("1. cnf.jkt", tc["cnf"]["jkt"] == thumbprint)
 
