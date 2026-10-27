@@ -1,0 +1,153 @@
+name: SDK Workload OIDC Test
+
+on: workflow_dispatch
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  workload-oidc-e2e:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Get GitHub OIDC token
+      run: |
+        TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://auth-qa.saviyntcloud.com/rlm_y5mnwk00mf" \
+          | jq -r '.value')
+        echo "::add-mask::$TOKEN"
+        echo "WORKLOAD_TOKEN=$TOKEN" >> $GITHUB_ENV
+        
+        echo "=== GitHub OIDC Claims ==="
+        echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq '{iss, sub, aud, ref, repository, workflow}' || true
+
+    - name: Install dependencies
+      run: pip install httpx cryptography PyJWT
+
+    - name: Exchange at ATB and call gateway
+      env:
+        WORKLOAD_TOKEN: ${{ env.WORKLOAD_TOKEN }}
+        DPOP_KEY_PEM: ${{ secrets.DPOP_PRIVATE_KEY_PEM }}
+      run: |
+        python3 << 'PYEOF'
+        import os, asyncio, httpx, json, base64, time, hashlib, uuid
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import serialization
+        import jwt as pyjwt
+
+        REALM_URI = "https://auth-qa.saviyntcloud.com/rlm_y5mnwk00mf"
+        GW_URL = "https://identity-qa-gateway-dataplane.saviyntcloud.com/mcp/c921beed-92bf-428e-bb14-900c6621795d"
+        TOKEN_URL = f"{REALM_URI}/token"
+
+        wl_token = os.environ["WORKLOAD_TOKEN"]
+        dpop_pem = os.environ["DPOP_KEY_PEM"]
+
+        # Decode GitHub OIDC claims
+        claims = json.loads(base64.urlsafe_b64decode(wl_token.split(".")[1] + "=="))
+        print(f"GitHub OIDC issuer: {claims['iss']}")
+        print(f"GitHub OIDC sub: {claims['sub']}")
+        print(f"GitHub OIDC aud: {claims['aud']}")
+
+        # Load the pre-registered DPoP key
+        private_key = serialization.load_pem_private_key(dpop_pem.encode(), password=None)
+        numbers = private_key.public_key().public_numbers()
+        def b64url(n, length):
+            return base64.urlsafe_b64encode(n.to_bytes(length, 'big')).decode().rstrip('=')
+        public_jwk = {"kty": "EC", "crv": "P-256", "x": b64url(numbers.x, 32), "y": b64url(numbers.y, 32)}
+        canonical = json.dumps({k: public_jwk[k] for k in ("crv", "kty", "x", "y")}, separators=(',', ':'))
+        thumbprint = base64.urlsafe_b64encode(hashlib.sha256(canonical.encode()).digest()).decode().rstrip('=')
+        print(f"DPoP thumbprint: {thumbprint}")
+
+        P = []; F = []
+        def ck(tag, cond, ev=""):
+            ok = bool(cond); (P if ok else F).append(tag)
+            print(f"  [{'PASS' if ok else 'FAIL'}] {tag}")
+            if ev: print(f"         evidence: {ev}")
+
+        def build_proof(htm, htu, access_token=None):
+            header = {"typ": "dpop+jwt", "alg": "ES256", "jwk": public_jwk}
+            payload = {"htm": htm, "htu": htu, "jti": str(uuid.uuid4()), "iat": int(time.time())}
+            if access_token:
+                payload["ath"] = base64.urlsafe_b64encode(
+                    hashlib.sha256(access_token.encode()).digest()).decode().rstrip('=')
+            return pyjwt.encode(payload, private_key, algorithm="ES256", headers=header)
+
+        def jp(t):
+            p = t.split(".")[1]; p += "=" * (4 - len(p) % 4)
+            return json.loads(base64.urlsafe_b64decode(p))
+
+        def pm(t):
+            t = t.strip()
+            if t.startswith("{"): return json.loads(t)
+            for l in t.splitlines():
+                if l.startswith("data:"): return json.loads(l[5:].strip())
+            return {}
+
+        async def run():
+            async with httpx.AsyncClient(timeout=30) as c:
+                print("\n=== WORKLOAD OIDC E2E (GitHub Actions) ===")
+
+                # 1. Exchange
+                proof = build_proof("POST", TOKEN_URL)
+                r = await c.post(TOKEN_URL, data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                    "assertion": wl_token,
+                    "scope": "read write",
+                    "resource": GW_URL,
+                }, headers={"DPoP": proof})
+                ck("1. ATB exchange", r.status_code == 200, f"HTTP {r.status_code}")
+                if r.status_code != 200:
+                    print(f"   {r.text[:300]}"); return
+
+                tok = r.json()["access_token"]; tc = jp(tok)
+                ck("1. DPoP type", r.json()["token_type"] == "DPoP")
+                ck("1. sub=agent", tc["sub"] == "agt_xv4xkrvhmk", tc["sub"])
+                ck("1. iss=realm", tc["iss"] == REALM_URI)
+                ck("1. cnf.jkt", tc["cnf"]["jkt"] == thumbprint)
+
+                # 2. Gateway
+                p2 = build_proof("POST", GW_URL, tok)
+                r = await c.post(GW_URL,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                          "params": {"protocolVersion": "2025-03-26", "capabilities": {},
+                                     "clientInfo": {"name": "github-oidc", "version": "1.0"}}},
+                    headers={"Authorization": f"DPoP {tok}", "DPoP": p2,
+                             "Content-Type": "application/json",
+                             "Accept": "application/json, text/event-stream"})
+                sid = r.headers.get("mcp-session-id", "")
+                ck("2. Gateway init", r.status_code == 200)
+                ck("2. Session", bool(sid), sid[:30] if sid else "none")
+
+                if sid:
+                    p3 = build_proof("POST", GW_URL, tok)
+                    r = await c.post(GW_URL,
+                        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                        headers={"Authorization": f"DPoP {tok}", "DPoP": p3,
+                                 "Content-Type": "application/json",
+                                 "Accept": "application/json, text/event-stream",
+                                 "mcp-session-id": sid})
+                    tools = pm(r.text).get("result", {}).get("tools", [])
+                    ck("2. Tools", len(tools) > 0, f"{len(tools)}")
+
+                    if tools:
+                        p4 = build_proof("POST", GW_URL, tok)
+                        r = await c.post(GW_URL,
+                            json={"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                  "params": {"name": tools[0]["name"], "arguments": {}}},
+                            headers={"Authorization": f"DPoP {tok}", "DPoP": p4,
+                                     "Content-Type": "application/json",
+                                     "Accept": "application/json, text/event-stream",
+                                     "mcp-session-id": sid})
+                        ck("2. Tool call", r.status_code == 200)
+
+                print(f"\n{'='*50}")
+                print(f"GITHUB OIDC E2E: {len(P)} passed, {len(F)} failed")
+                print(f"{'='*50}")
+                if F:
+                    for f_ in F: print(f"  FAILED: {f_}")
+                    exit(1)
+                else:
+                    print("ALL VERIFIED.")
+
+        asyncio.run(run())
+        PYEOF
